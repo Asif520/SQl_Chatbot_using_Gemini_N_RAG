@@ -1,3 +1,16 @@
+import os,shutil
+
+os.environ["STREAMLIT_HOME"] = "/app/.streamlit"
+os.environ["STREAMLIT_CONFIG_DIR"] = "/app/.streamlit"
+os.makedirs("/app/.streamlit", exist_ok=True)
+
+# Fix Hugging Face cache issue
+os.environ["HF_HOME"] = "/app/model_cache"
+os.environ["TRANSFORMERS_CACHE"] = "/app/model_cache"
+os.environ["SENTENCE_TRANSFORMERS_HOME"] = "/app/model_cache"
+os.makedirs("/app/model_cache", exist_ok=True)
+os.chmod("/app/model_cache", 0o777)
+
 import google.generativeai as genai
 import re
 import streamlit as st
@@ -5,11 +18,11 @@ import numpy as np # linear algebra
 import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
 from sentence_transformers import SentenceTransformer
 import faiss
-import re
 import json
 import psycopg2
 import warnings
 warnings.filterwarnings("ignore")
+
 
 def load_schema():
     with open("data/tables.json", "r") as f:
@@ -90,9 +103,26 @@ def qus_data_examples():
 
     return qus_examples
 
+def get_dir_size(path="."):
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            if os.path.exists(fp):
+                total += os.path.getsize(fp)
+    return total / (1024 ** 3)  # GB
+
 @st.cache_resource
 def load_embedder():
-    return SentenceTransformer("BAAI/bge-base-en-v1.5")
+    if os.path.exists("/app/model_cache"):
+        size_gb = get_dir_size("/app/model_cache")
+        if size_gb > 30:  # you can change threshold
+            shutil.rmtree("/app/model_cache")
+            os.makedirs("/app/model_cache", exist_ok=True)
+    else:
+        os.makedirs("/app/model_cache", exist_ok=True)
+    
+    return SentenceTransformer("BAAI/bge-base-en-v1.5", cache_folder="/app/model_cache")
 
 @st.cache_resource
 def load_indexes():
@@ -100,77 +130,164 @@ def load_indexes():
     index_qus = faiss.read_index("data/qus_example.index")
     return index,index_qus
 
-# def embed_store_tokens(sql_examples,qus_examples):
-#
-#     example_embeddings = np.load("data/example_embeddings.npy")
-#
-#     dimension = example_embeddings.shape[1]  # Embedding size (e.g., 768 for bge-base)
-#     index = faiss.IndexFlatL2(dimension)  # Simple L2 distance index; for large datasets, consider IndexIVFFlat for faster search
-#     index.add(example_embeddings)  # Add vectors to index
-#
-#     qus_example_embedding = np.load("data/qus_example_embedding.npy")
-#
-#     dimension_qus = qus_example_embedding.shape[1]  # Embedding size (e.g., 768 for bge-base)
-#     index_qus = faiss.IndexFlatL2(dimension_qus)  # Simple L2 distance index; for large datasets, consider IndexIVFFlat for faster search
-#     index_qus.add(qus_example_embedding)  # Add vectors to index
-#
-#     return index,index_qus
 
+# def generate_sql_with_custom_rag(gemini_model,schema, embedder,request,conversation_history,sql_examples,index, max_length=1024, temperature=0.4, top_p=0.9, k=3):
+#     try:
+#         # Step 1: Create a query string for retrieval
+#         query_text = f"Schema: {schema}\nRequest: {request}\nContext: {conversation_history}"
+#         query_embedding = embedder.encode([query_text], convert_to_tensor=False)
+#         query_embedding = np.array(query_embedding).astype('float32')
+
+#         # Step 2: Retrieve top-k similar examples using FAISS
+#         distances, indices = index.search(query_embedding, k)
+#         retrieved_examples = [sql_examples[idx] for idx in indices[0] if idx != -1]
+
+#         # Step 3: Format retrieved examples for prompt
+#         examples_str = "\n\n".join(retrieved_examples) if retrieved_examples else "No similar examples found."
+
+#         # Step 4: Build prompt
+#         prompt = f"""
+#         You are a SQL expert. 
+#         Use the following examples, schema, and conversation context to generate a single, correct SQL query. 
+#         Assume a standard SQL database (PostgreSQL/MySQL). Use single quote ('') for string reference.
+#         Return only the SQL query — no explanations.
+
+#         Examples:
+#         {examples_str}
+
+#         Database Schema:
+#         {schema}
+
+#         Conversation Context:
+#         {conversation_history}
+
+#         Request:
+#         {request}
+#         """
+
+#         # Step 5: Generate SQL using Gemini
+#         response = gemini_model.generate_content(
+#             prompt,
+#             generation_config={
+#                 "temperature": temperature,
+#                 "top_p": top_p,
+#                 "max_output_tokens": 300,
+#             }
+#         )
+
+#         text = response.text.strip()
+
+#         sql_match = re.search(r"(SELECT.*?\n)", text, re.DOTALL | re.IGNORECASE)
+#         if sql_match:
+#             text = sql_match.group(1).strip()
+
+#         return text
+#     except Exception as e:
+#         return f"Error: {str(e)}"
+
+def validate_sql_query(query, schema):
+    """
+    Basic validation to check if the SQL query is likely valid and matches the schema.
+    Returns True if valid, False otherwise.
+    """
+    if not query or not isinstance(query, str):
+        return False
+    
+    # Check if query starts with SELECT and ends with semicolon
+    if not re.match(r'^\s*SELECT.*[;\n]*$', query, re.IGNORECASE | re.DOTALL):
+        return False
+    
+    # Extract schema columns for validation (e.g., "sales_table(id, region TEXT, sale_date DATE, sales INTEGER)")
+    schema_columns = []
+    for table_def in schema.split('),'):
+        table_def = table_def.strip().strip(')')
+        if '(' in table_def:
+            cols_part = table_def.split('(')[1]
+            cols = [col.split()[0].lower() for col in cols_part.split(',')]
+            schema_columns.extend(cols)
+    
+    # Check if query references at least one schema column
+    query_lower = query.lower()
+    return any(col in query_lower for col in schema_columns)
 
 def generate_sql_with_custom_rag(gemini_model,schema, embedder,request,conversation_history,sql_examples,index, max_length=1024, temperature=0.4, top_p=0.9, k=3):
     try:
-        # Step 1: Create a query string for retrieval
-        query_text = f"Schema: {schema}\nRequest: {request}\nContext: {conversation_history}"
-        query_embedding = embedder.encode([query_text], convert_to_tensor=False)
-        query_embedding = np.array(query_embedding).astype('float32')
+        def generate_sql_query(query_text):
+            # Step 1: Create a query string for retrieval
+            query_text = query_text
+            query_embedding = embedder.encode([query_text], convert_to_tensor=False)
+            query_embedding = np.array(query_embedding).astype('float32')
+    
+            # Step 2: Retrieve top-k similar examples using FAISS
+            distances, indices = index.search(query_embedding, k)
+            retrieved_examples = [sql_examples[idx] for idx in indices[0] if idx != -1]
+    
+            # Step 3: Format retrieved examples for prompt
+            examples_str = "\n\n".join(retrieved_examples) if retrieved_examples else "No similar examples found."
+    
+            # Step 4: Build prompt
+            prompt = f"""
+            You are a SQL expert. 
+            Use the following examples, schema, and conversation context to generate a single, correct SQL query. 
+            Assume a standard SQL database (PostgreSQL/MySQL). Use single quote ('') for string reference.
+            Return only the SQL query — no explanations.
+    
+            Examples:
+            {examples_str}
+    
+            Database Schema:
+            {schema}
+    
+            Conversation Context:
+            {conversation_history}
+    
+            Request:
+            {request}
+            """
+    
+            # Step 5: Generate SQL using Gemini
+            response = gemini_model.generate_content(
+                prompt,
+                generation_config={
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "max_output_tokens": 300,
+                }
+            )
+    
+            text = response.text.strip()
+    
+            sql_match = re.search(r"(SELECT.*?[;\n])", text, re.DOTALL | re.IGNORECASE)
+            if sql_match:
+                text = sql_match.group(1).strip()
+    
+            return text
 
-        # Step 2: Retrieve top-k similar examples using FAISS
-        distances, indices = index.search(query_embedding, k)
-        retrieved_examples = [sql_examples[idx] for idx in indices[0] if idx != -1]
+        query_text = f"Schema: {schema}\nRequest: {request}"
+        sql_query = generate_sql_query(query_text)
 
-        # Step 3: Format retrieved examples for prompt
-        examples_str = "\n\n".join(retrieved_examples) if retrieved_examples else "No similar examples found."
+        # Step 2: Validate the generated SQL
+        if validate_sql_query(sql_query, schema):
+            return sql_query
 
-        # Step 4: Build prompt
-        prompt = f"""
-        You are a SQL expert. 
-        Use the following examples, schema, and conversation context to generate a single, correct SQL query. 
-        Assume a standard SQL database (PostgreSQL/MySQL).
-        Return only the SQL query — no explanations.
+        history_text = ""
+        if conversation_history and "messages" in conversation_history:
+            recent_messages = conversation_history["messages"][-3:]  # Limit to last 3 for context
+            history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in recent_messages])
+        
+        query_text_with_history = f"Schema: {schema}\nRequest: {request}\nContext: {history_text}"
+        sql_query = generate_sql(query_text_with_history)
+        
+        # # Step 4: Validate again; return even if invalid to avoid infinite retries
+        # if validate_sql_query(sql_query, schema):
+        #     return sql_query
+        
+        return sql_query
 
-        Examples:
-        {examples_str}
-
-        Database Schema:
-        {schema}
-
-        Conversation Context:
-        {conversation_history}
-
-        Request:
-        {request}
-        """
-
-        # Step 5: Generate SQL using Gemini
-        response = gemini_model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": temperature,
-                "top_p": top_p,
-                "max_output_tokens": 300,
-            }
-        )
-
-        text = response.text.strip()
-
-        sql_match = re.search(r"(SELECT.*?\n)", text, re.DOTALL | re.IGNORECASE)
-        if sql_match:
-            text = sql_match.group(1).strip()
-
-        return text
+        
     except Exception as e:
         return f"Error: {str(e)}"
-
+        
 
 def fetch_data_from_database(sql_query: str):
     conn = psycopg2.connect(
@@ -207,16 +324,12 @@ def generate_answer_from_json_data(gemini_model,json_data,embedder, request,conv
         Use the provided data and conversation context to answer the question.
         Be concise and human-readable. 
         Do not include extra commentary or repeat data.
-
         Examples:
         {examples_str}
-
         Data:
         {json_data}
-
         Conversation Context:
         {conversation_history}
-
         Question:
         {request}
         """
@@ -268,10 +381,58 @@ def format_conversation_history(conversation_history):
         formatted += f"{msg['role'].capitalize()}: {msg['content']}\n"
     return formatted.strip()
 
+
+
+    # ---- Helper Functions ----
+def load_conversation_from_db():
+    conn = psycopg2.connect(
+        host="ep-long-tooth-a1zzotwg-pooler.ap-southeast-1.aws.neon.tech",  # e.g., ep-silent-sunset-123456.neon.tech
+        dbname="neondb",
+        user="neondb_owner",
+        password="npg_Bd06StQryYlV",
+        sslmode="require")
+    cur = conn.cursor()
+    cur.execute("SELECT role, content FROM conversation_history ORDER BY id ASC")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"role": role, "content": content} for role, content in rows]
+
+def save_conversation_to_db(history):
+    conn = psycopg2.connect(
+        host="ep-long-tooth-a1zzotwg-pooler.ap-southeast-1.aws.neon.tech",  # e.g., ep-silent-sunset-123456.neon.tech
+        dbname="neondb",
+        user="neondb_owner",
+        password="npg_Bd06StQryYlV",
+        sslmode="require")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM conversation_history;")
+    conn.commit()
+    messages = history.get("messages", [])
+    for msg in messages:
+        if isinstance(msg, dict) and "role" in msg and "content" in msg:
+            cur.execute("INSERT INTO conversation_history (role, content) VALUES (%s, %s)",(msg["role"], msg["content"]))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def clear_conversation():
+    conn = psycopg2.connect(
+        host="ep-long-tooth-a1zzotwg-pooler.ap-southeast-1.aws.neon.tech",  # e.g., ep-silent-sunset-123456.neon.tech
+        dbname="neondb",
+        user="neondb_owner",
+        password="npg_Bd06StQryYlV",
+        sslmode="require")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM conversation_history")
+    conn.commit()
+    cur.close()
+    conn.close()
+
 if __name__=="__main__":
     st.set_page_config(page_title="SQL Chatbot", page_icon="🤖", layout="centered")
     st.title("🤖 SQL Chatbot (Gemini + RAG Ready)")
-    st.caption("Ask me anything about your database. Type below to start chatting!")
+    st.caption("Ask me anything about your database like product, customers, orders etc. Type below to start chatting!")
 
     schema = """ecommerce(customers(customer_id INT, first_name TEXT, last_name TEXT, email TEXT, phone TEXT, address TEXT, city TEXT, country TEXT, created_at TIMESTAMP)
     ,orders(order_id INT, customer_id INT, order_date TIMESTAMP, status TEXT, amount DECIMAL))"""
@@ -287,18 +448,20 @@ if __name__=="__main__":
     # Load model
     gemini_model = load_llm_model()
 
-    # Ensure proper structure in session_state
-    if "conversation_history" not in st.session_state or not isinstance(st.session_state.conversation_history, dict):
-        st.session_state.conversation_history = {"messages": []}
-    elif "messages" not in st.session_state.conversation_history:
-        st.session_state.conversation_history["messages"] = []
+    if "conversation_history" not in st.session_state:
+        db_history = load_conversation_from_db()
+        st.session_state.conversation_history = {"messages": db_history}
+
+    # if "conversation_history" not in st.session_state:
+    #     st.session_state.conversation_history = {"messages": db_history}
+    # elif not isinstance(st.session_state.conversation_history, dict):
+    #     st.session_state.conversation_history = {"messages": db_history}
+    # elif "messages" not in st.session_state.conversation_history:
+    #     st.session_state.conversation_history["messages"] = db_history
 
     # Display previous messages
     for msg in st.session_state.conversation_history["messages"]:
-        if msg["role"] == "user":
-            st.chat_message("user").write(msg["content"])
-        elif msg["role"] == "assistant":
-            st.chat_message("assistant").write(msg["content"])
+        st.chat_message(msg["role"]).write(msg["content"])
 
     # --- Chat input box ---
     if user_input := st.chat_input("Type your question or SQL request..."):
@@ -307,25 +470,24 @@ if __name__=="__main__":
         st.chat_message("user").write(user_input)
 
         # Format history for prompt (if your generate_text uses it)
-        history_text = format_conversation_history(st.session_state.conversation_history)
+        #history_text = format_conversation_history(st.session_state.conversation_history)
 
         # --- Generate model answer (your function here) ---
-        response = generate_text(gemini_model, schema, embedder, user_input, history_text, sql_examples, index,
+        response = generate_text(gemini_model, schema, embedder, user_input, st.session_state.conversation_history, sql_examples, index,
                                  qus_examples, index_qus)
 
         # Add assistant response
         st.session_state.conversation_history["messages"].append({"role": "assistant", "content": response})
         st.chat_message("assistant").write(response)
 
+        save_conversation_to_db(st.session_state.conversation_history)
+
     # Sidebar options
     st.sidebar.header("⚙️ Settings")
     if st.sidebar.button("🧹 Clear Conversation"):
-        st.session_state.conversation_history = []
+        clear_conversation()
+        st.session_state.conversation_history = {"messages": []}
         st.rerun()
 
     st.sidebar.markdown("---")
     st.sidebar.info("Built with ❤️ using Streamlit + Python\n\nModel backend: Gemini + Custom RAG")
-
-
-
-
